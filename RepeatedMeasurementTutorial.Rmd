@@ -1,0 +1,582 @@
+---
+title: "Understanding Repeated Measurement Models_v1"
+author: "Loreina Guo"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    code_folding: show
+    df_print: paged
+    css: style.css
+bibliography: references.bib
+link-citations: true
+---
+
+
+# Part 1. Repeated Measurements: Concept & Motivation
+
+## What are repeated measurements (with a medical example)?
+In clinical research, rather than checking efficacy once, we measure a patient at **multiple time points** (e.g., Baseline, Week 4, Week 8, Week 12). These endpoints over time are **repeated measurements** on the **same patient**. This design shows **how efficacy evolves** (improves, declines, or stays stable) instead of relying on a single snapshot .
+
+**Core problem – correlation.** Observations from the **same individual** are naturally **correlated**; today’s value is related to last week’s value. Methods must acknowledge this **within‑subject dependence** .
+
+> **Analogy.** A student’s test scores over a semester: a high score on Test 1 makes a high score on Test 2 more *likely*. We cannot treat the scores as independent.
+
+## Why use repeated measurements?
+- **Tell the story of change.** Track whether the drug acts early or late .  
+- **Statistical efficiency.** Each subject contributes multiple data points; often **fewer patients** are needed .  
+- **Reveal patterns.** Gradual improvement, rebound, plateau—all visible with multiple visits .  
+- **Self‑control.** Each subject acts as their **own control**, reducing between‑person noise .
+
+## Key challenges
+- **Ignoring correlation → false confidence.** Standard errors become too small; p‑values too optimistic .  
+- **Missing data is common.** Good methods use **all available data** under plausible assumptions rather than discarding subjects .  
+- **Unbalanced designs.** Visits may be unequally spaced with incomplete follow‑up .  
+- **Clinically meaningful outputs.** Stakeholders want **by‑visit group differences**.
+
+## First look: plots tell stories
+We start with two plots:
+
+1) **Individual trajectories (spaghetti).** One line per subject over time: check parallelism, variability, outliers.  
+2) **Mean profiles with 95% CI.** Average trend for each group with uncertainty.
+
+```{r part1-firstlook, message=FALSE, warning=FALSE}
+if (!requireNamespace("ggplot2", quietly = TRUE)) install.packages("ggplot2", repos="https://cloud.r-project.org")
+if (!requireNamespace("dplyr", quietly = TRUE)) install.packages("dplyr", repos="https://cloud.r-project.org")
+library(ggplot2); library(dplyr)
+
+set.seed(1001)
+n <- 80
+id <- factor(seq_len(n))
+arm <- factor(sample(c("Placebo","Drug"), n, replace=TRUE))
+vis <- c(0,4,8,12)
+d1 <- expand.grid(id=id, visit=vis)
+d1 <- dplyr::left_join(d1, data.frame(id=id, arm=arm), by="id")
+# outcome with group difference growing over time
+mu0 <- 10 + 0.1*d1$visit
+delta <- 0.0 + 0.2*(d1$visit>=4) + 0.5*(d1$visit>=8) + 1.0*(d1$visit>=12)
+eta <- mu0 + ifelse(d1$arm=="Drug", delta, 0)
+d1$y <- rnorm(nrow(d1), eta, sd=1.5)
+
+# spaghetti
+p_sp <- ggplot(d1, aes(visit, y, group=id, color=arm)) +
+  geom_line(alpha=.25) +
+  labs(title="Individual trajectories (spaghetti)", x="Visit (week)", y="Outcome")
+
+# mean +/- 95% CI
+d1s <- d1 |>
+  group_by(arm, visit) |>
+  summarise(m=mean(y), se=sd(y)/sqrt(n()), .groups="drop")
+p_mean <- ggplot(d1s, aes(visit, m, color=arm)) +
+  geom_line() + geom_point() +
+  geom_errorbar(aes(ymin=m-1.96*se, ymax=m+1.96*se), width=.4) +
+  labs(title="Mean profiles with 95% CI", x="Visit (week)", y="Adjusted mean (approx.)")
+
+p_sp; p_mean
+```
+
+
+### How to read these plots
+
+**Spaghetti (individual trajectories).**  
+- Each line is one patient over time. Most lines trend upward in both groups, but the **Drug** lines tend to rise more steeply after mid‑study.  
+- There is meaningful patient‑to‑patient variability (lines are not perfectly parallel), which is normal and motivates a model that **accounts for within‑person correlation**.  
+- No single extreme outlier dominates; a few atypical slopes exist but do not drive the overall pattern.
+
+**Mean profiles with 95% CI (group averages).**  
+- **Baseline** means are similar between groups (as expected in randomization).  
+- By **Week 4** there is little separation.  
+- At **Week 8**, the Drug mean begins to pull above Placebo; error bars overlap less.  
+- By **Week 12**, Drug is clearly higher and the 95% CIs show minimal overlap, suggesting a **clinically meaningful** difference.  
+- The widening gap indicates a **time‑dependent** treatment effect rather than an immediate effect.
+
+**Implications for modeling.**  
+- Include a **treatment × visit** interaction (effect changes over time).  
+- Because repeated measures are correlated, use **MMRM** (and compare AR(1) vs UN via AIC) for valid SEs and CIs.
+
+> *Exploratory plots show broadly upward trajectories in both arms, with a steeper increase for Drug from Week 8 onward. Group mean profiles diverge progressively, with the largest separation at Week 12. These patterns motivate a model with a treatment‑by‑visit interaction and an appropriate within‑subject correlation structure (evaluated via AR(1) vs unstructured in the MMRM analysis).*
+
+
+# Part 2. Methods for Repeated Measurements (Overview)
+
+- **RM‑ANOVA.** Traditional; works best for **balanced** data with **sphericity**; fragile to missingness .  
+- **Random‑Effects LMM.** Adds random intercepts/slopes to model **individual trajectories**; flexible with unbalanced data .  
+- **MMRM.** Likelihood‑based; targets **visit‑specific adjusted means**; models residual covariance; valid under **MAR** .  
+- **GEE.** **Population‑averaged** inference; excellent for **binary/count** outcomes with a working correlation .
+
+# Part 3. MMRM (continuous outcome; missingness allowed; by‑visit reporting)
+
+##  Theory in plain language (with formula)
+**Goal.** Estimate **group differences by visit** using all available data, acknowledging **within‑subject correlation**.
+
+**Model.**
+\[ Y_{ij} = X_{ij}\beta + \varepsilon_{ij}, \qquad \varepsilon_i \sim \mathcal{N}(0, \Sigma). \]
+- \(Y_{ij}\): response of subject *i* at visit *j*.  
+- \(X_{ij}\beta\): **fixed‑effects mean** (treatment, visit, treatment×visit, optional baseline).  
+- \(\Sigma\): **within‑subject covariance** across visits (captures correlation).  
+- Estimation via (RE)ML; valid under **Missing At Random (MAR)** if the mean/covariance are correctly specified .
+
+**Common covariance structures (what they mean).**
+- **UN (Unstructured):** each visit has its **own variance**; each visit‑pair has its **own covariance**. Most flexible; more parameters.  
+- **AR(1):** correlation decays with time lag (nearby visits more alike); assumes regular spacing.  
+- **CS (Compound Symmetry):** all visits share the **same correlation**; simplest; may be too rigid.
+
+**Choosing a structure.** Compare **AIC/BIC** and consider scientific plausibility (do correlations decay with lag?).
+
+> **Super Simplified Model (MMRM):**  
+> $$\text{Measured outcome at each visit} \approx \underbrace{\text{Average trend by group and visit}}_{\text{fixed effects }X\beta} \;+\; \underbrace{\text{individual deviation/noise}}_{\varepsilon_{ij}\ \text{with correlation }\Sigma}$$  
+> The key is that the *deviation* part is **filtered with a covariance** \(\Sigma\) so that repeated measures on the same person are **not** treated as independent.
+
+**Mini example (plain language).** Two patients on Drug and two on Placebo are measured at Baseline/Week 4/Week 8. MMRM estimates the **adjusted mean** in each arm at each visit (e.g., Drug at Week 8), and their **difference** (Drug − Placebo). Because repeated measures are correlated, MMRM models that correlation (UN/AR(1)/CS) so your **SEs and CIs** are correct.
+
+##  Hands‑on in R (independent scenario: continuous outcome with dropout)
+We simulate a trial with **dropout** and fit MMRM using `nlme::gls` with UN/AR(1).
+
+```{r part3b-mmrm, message=FALSE, warning=FALSE}
+if (!requireNamespace("nlme", quietly = TRUE)) install.packages("nlme", repos="https://cloud.r-project.org")
+if (!requireNamespace("emmeans", quietly = TRUE)) install.packages("emmeans", repos="https://cloud.r-project.org")
+if (!requireNamespace("dplyr", quietly = TRUE)) install.packages("dplyr", repos="https://cloud.r-project.org")
+if (!requireNamespace("ggplot2", quietly = TRUE)) install.packages("ggplot2", repos="https://cloud.r-project.org")
+library(nlme); library(emmeans); library(dplyr); library(ggplot2)
+
+set.seed(2003)
+simulate_mmrm_data <- function(n=200, visits=c(0,4,8,12), dropout_prob=0.15) {
+  id <- factor(seq_len(n))
+  trt <- factor(sample(c("Placebo","Drug"), n, TRUE))
+  d <- expand.grid(id=id, visit=visits)
+  d <- dplyr::left_join(d, data.frame(id=id, trt=trt), by="id")
+  # mean structure: drug effect grows over time
+  base <- 20 + 0.3*d$visit
+  eff  <- 0.0 + 0.3*(d$visit>=4) + 0.8*(d$visit>=8) + 1.2*(d$visit>=12)
+  mu   <- base + ifelse(d$trt=="Drug", eff, 0)
+  # AR(1)-like individual noise
+  rho <- 0.6
+  d <- d |> dplyr::arrange(id, visit)
+  y <- numeric(nrow(d))
+  for (ii in levels(id)) {
+    idx <- which(d$id==ii)
+    e <- as.numeric(arima.sim(model=list(ar=rho), n=length(idx), sd=1))
+    y[idx] <- mu[idx] + e
+  }
+  d$y <- y
+  # simulate dropout at last one or two visits for a subset
+  keep <- rep(TRUE, nrow(d))
+  byid <- split(seq_len(nrow(d)), d$id)
+  for (ii in names(byid)) {
+    if (runif(1) < dropout_prob) {
+      idx <- byid[[ii]]
+      k <- sample(1:2, 1)
+      keep_tail <- tail(idx, k)
+      keep[keep_tail] <- FALSE
+    }
+  }
+  d <- d[keep, , drop=FALSE]
+  d$visit_f <- factor(d$visit, levels=visits)
+  d <- d |> dplyr::arrange(id, visit)
+  d$visit_index <- as.numeric(d$visit_f)
+  d
+}
+
+dat_mmrm <- simulate_mmrm_data()
+
+# UN (via corSymm + varIdent) and AR(1) fits
+fit_un <- nlme::gls(
+  y ~ trt*visit_f,
+  data = dat_mmrm,
+  correlation = nlme::corSymm(form = ~ visit_index | id),
+  weights    = nlme::varIdent(form = ~ 1 | visit_f),
+  method     = "REML",
+  na.action  = na.omit
+)
+fit_ar1 <- nlme::gls(
+  y ~ trt*visit_f,
+  data = dat_mmrm,
+  correlation = nlme::corAR1(form = ~ visit_index | id),
+  method     = "REML",
+  na.action  = na.omit
+)
+AIC(fit_un, fit_ar1)
+
+# Visit-specific adjusted means and pairwise differences
+emm <- emmeans::emmeans(fit_un, ~ trt | visit_f)
+emm
+contrast(emm, method="pairwise")
+
+# Plot LS-means with 95% CI
+emm_df <- as.data.frame(emm)
+ggplot(emm_df, aes(as.numeric(visit_f), emmean, color=trt)) +
+  geom_line() + geom_point() +
+  geom_errorbar(aes(ymin=lower.CL, ymax=upper.CL), width=.3) +
+  scale_x_continuous(breaks=seq_along(levels(dat_mmrm$visit_f)), labels=levels(dat_mmrm$visit_f)) +
+  labs(title="MMRM: Adjusted means by visit (95% CI)", x="Visit", y="Adjusted mean")
+```
+
+### What the code is doing (step‑by‑step)
+- **Simulate trial data** with visits and random dropout; Drug effect grows over time.  
+- **Fit two MMRMs**: UN (flexible) vs AR(1) (decaying correlation).  
+- **Compare AIC** to choose a plausible covariance.  
+- **Compute adjusted means** and **pairwise differences** per visit via `emmeans`.  
+- **Plot LS‑means with 95% CI** to show how the treatment effect evolves across visits.
+
+##  Interpretation & reporting (MMRM — expanded)
+
+### Step 1. Visit-specific adjusted means
+The table of estimated marginal means (EMMeans) reports the **model-adjusted mean** for each treatment at each visit, with standard errors and 95% confidence intervals. These are already adjusted for covariates and missing data under MAR.
+
+- **What it answers:** “What is the expected mean outcome for each arm at each visit, after adjusting for the model?”  
+- **How to read:** Compare Drug vs Placebo **row-by-row by visit**; overlapping CIs typically imply small or non‑significant differences.
+
+**Plain-English interpretation for the example output you saw:**  
+- Baseline means are similar (≈22).  
+- Means remain close through Week 8.  
+- Drug ticks up slightly by Week 12, but confidence intervals still overlap substantially → any difference is small.
+
+### Step 2. Pairwise visit-specific differences
+The `contrast(emm, "pairwise")` table gives **Drug − Placebo** at each visit (Δ), with SE, df, t and p.
+
+- **What it answers:** “At a given visit, is there a treatment difference?”  
+- **How to read:** Sign of Δ shows direction (positive = Drug > Placebo). Look at **95% CI** and **p** to judge statistical and clinical relevance.
+
+**Plain-English interpretation for the example contrasts:**  
+- All Δ are small in magnitude (|Δ| < 0.3) and **not statistically significant** (all p > 0.48).  
+- The sign turns slightly positive at Week 12, consistent with the tiny separation in the means, but still not meaningful.
+
+### Step 3. LS-means plot (what it shows)
+The LS‑means plot visualizes **adjusted mean profiles** with **95% CIs** by visit.
+
+- **Lines:** adjusted means for each arm over time (reflecting the treatment × visit pattern).  
+- **Error bars:** uncertainty around each adjusted mean.  
+- **Reading:** Persistent overlap of error bars across visits supports the numeric finding of **no detectable separation**.
+
+### Step 4. One-paragraph, report-ready narrative
+*The mixed-model for repeated measures (MMRM) with an unstructured covariance matrix showed no evidence of a treatment-by-visit interaction (p > 0.4). Adjusted group means were similar at all visits (≈22 units), and visit-specific contrasts (Drug − Placebo) were small (|Δ| < 0.3) with wide overlap in 95% confidence intervals (all p > 0.48). The LS‑means profiles mirrored these results, showing closely tracking trajectories without meaningful divergence. These conclusions were obtained while accounting for within-subject correlation and using all available data under the missing-at-random assumption.*
+
+### Step 5. Super Simplified Model (recap)
+$$\text{Outcome at visit} \approx \underbrace{\text{Average trend by group and visit}}_{\text{fixed effects}} \;+\; \underbrace{\text{individual deviation}}_{\varepsilon_{ij}\ \text{correlated within subject via } \Sigma}$$
+**Idea:** the *deviation* term is filtered by a covariance matrix \(\Sigma\), so repeated measures on the same person are **not treated as independent**, giving correct SEs and CIs for by-visit comparisons.
+
+# Part 4. RM-ANOVA (continuous outcome; balanced complete data)
+
+##  Theory in plain language (with formula)
+**Goal.** Test whether mean response differs across visits and by treatment in **balanced** designs.
+**Model idea.** Treat **visit** as a within-subject factor; requires **sphericity** (equal variances of differences). Violations inflate type‑I error; apply Greenhouse–Geisser/HF corrections.
+
+> **Super Simplified Model (RM‑ANOVA):**
+> $$\text{Outcome} \approx \text{Group} + \text{Visit} + \text{Group}\times\text{Visit} + \text{within‑person error (sphericity)}$$
+
+##  Hands‑on in R (balanced, no missing)
+```{r part4b-rmanova, message=FALSE, warning=FALSE}
+if (!requireNamespace("dplyr", quietly = TRUE)) install.packages("dplyr", repos="https://cloud.r-project.org")
+if (!requireNamespace("tidyr", quietly = TRUE)) install.packages("tidyr", repos="https://cloud.r-project.org")
+library(dplyr); library(tidyr)
+
+set.seed(3005)
+simulate_balanced <- function(n=60, visits=c(0,4,8,12)) {
+  id <- factor(seq_len(n))
+  trt <- factor(rep(c("Placebo","Drug"), length.out=n))
+  d <- expand.grid(id=id, visit=visits)
+  d <- dplyr::left_join(d, data.frame(id=id, trt=trt), by="id")
+  mu <- 15 + 0.4*d$visit + ifelse(d$trt=="Drug", 0.8*(d$visit>=8)+1.2*(d$visit>=12), 0)
+  d$y <- rnorm(nrow(d), mu, 1.2)
+  d$visit_f <- factor(d$visit, levels=visits)
+  d
+}
+dat_bal <- simulate_balanced()
+rm_aov <- aov(y ~ trt*visit_f + Error(id/visit_f), data=dat_bal)
+summary(rm_aov)
+```
+
+##  Interpretation & reporting (RM‑ANOVA — expanded)
+### Step 1. Understanding the output
+Two error terms:
+- **Error: id** — between‑subject (tests **treatment** main effect averaged over visits).
+- **Error: id:visit_f** — within‑subject (tests **visit** main effect and **treatment×visit** interaction).
+
+### Step 2. What the numbers mean
+- **Treatment** significant → overall difference between groups across visits.
+- **Visit** significant → responses change over time.
+- **Treatment×Visit** significant → profiles differ over time (non‑parallel lines).
+
+### Step 3. Optional mean-profile visualization
+```{r part4b-plot, message=FALSE, warning=FALSE}
+if (!requireNamespace("ggplot2", quietly = TRUE)) install.packages("ggplot2", repos="https://cloud.r-project.org")
+library(ggplot2)
+ggplot(dat_bal, aes(visit_f, y, color=trt, group=trt)) +
+  stat_summary(fun = mean, geom = "line") +
+  stat_summary(fun.data = mean_cl_normal, geom = "errorbar", width = 0.2) +
+  labs(title="RM-ANOVA: mean profiles ± SE", x="Visit", y="Outcome")
+```
+
+### Step 4. One‑paragraph narrative (report‑ready)
+*RM‑ANOVA revealed significant effects of treatment, visit, and their interaction, indicating that outcomes changed over time and that Drug’s trajectory differed from Placebo. Mean profiles showed a steeper improvement for Drug, consistent with the interaction. Because RM‑ANOVA assumes sphericity, results should be corroborated with MMRM or LMM in the presence of missing or unequal spacing.*
+
+### Step 5. Super simplified model
+$$
+Y_{ij} = \mu + \alpha_{\text{trt}} + \beta_{\text{visit}} + (\alpha\beta)_{\text{trt}:\text{visit}} + \varepsilon_{ij}
+$$
+with within‑subject errors satisfying sphericity (equal variances of differences across visits).
+
+# Part 5. Random‑Effects LMM (subject‑specific trajectories)
+
+##  Theory in plain language (with formula)
+**Goal.** Describe **individual trajectories** via random effects.  
+**Model.**
+\[ Y_{ij} = X_{ij}\beta + Z_{ij}b_i + \varepsilon_{ij}, \qquad b_i\sim\mathcal{N}(0,D),\; \varepsilon_{ij}\sim\mathcal{N}(0,\sigma^2). \]
+- \(\beta\): **population‑level** (fixed) effects.  
+- \(b_i\): **subject‑specific** random effects (e.g., random intercept/slope).  
+- Focus on **variance components** and their correlation [@Verbeke2009].
+
+> **Super Simplified Model (LMM):**  
+> $$\text{Outcome} \approx \underbrace{\text{Average baseline + average time trend}}_{\text{fixed effects}} \;+\; \underbrace{\text{personal baseline} + \text{personal trend}}_{\text{random effects}} \;+\; \text{noise}$$  
+> LMM explains **how individuals differ** around the average curve. Random effects quantify **how much** people vary at baseline and in growth rates, and **how these two vary together** (correlation).
+
+**Mini example.** In a growth study, some patients start higher (baseline) and some grow faster (slope). LMM estimates the **average** growth and the **spread** of individual growth around that average.
+
+##  Hands‑on in R (independent scenario: growth curves)
+```{r part5b-lmm, message=FALSE, warning=FALSE}
+if (!requireNamespace("nlme", quietly = TRUE)) install.packages("nlme", repos="https://cloud.r-project.org")
+if (!requireNamespace("ggplot2", quietly = TRUE)) install.packages("ggplot2", repos="https://cloud.r-project.org")
+library(nlme); library(ggplot2)
+
+set.seed(4007)
+simulate_growth <- function(n=120, visits=0:6) {
+  id <- factor(seq_len(n))
+  trt <- factor(sample(c("Placebo","Drug"), n, TRUE))
+  d <- expand.grid(id=id, visit=visits)
+  d <- merge(d, data.frame(id=id, trt=trt), by="id")
+  # subject-specific intercept/slope
+  b0 <- rnorm(n, 10, 1.0); b1 <- rnorm(n, 0.7, 0.25)
+  mu <- with(d, b0[as.integer(id)] + b1[as.integer(id)]*visit + ifelse(trt=="Drug", 0.4*visit, 0))
+  d$y <- rnorm(nrow(d), mu, 1.0)
+  d
+}
+dat_lmm <- simulate_growth()
+lme_fit <- nlme::lme(y ~ trt*visit, random = ~ visit | id, data = dat_lmm)
+summary(lme_fit)
+```
+
+### What the code is doing
+- **Simulate growth data** with random intercepts/slopes (each subject has a personal baseline and growth rate).  
+- Fit **LMM** using `nlme::lme` with random effects `~ visit | id`.  
+- **Read fixed effects** (population average trend) and **random effects** (between‑subject variability and correlation).
+
+##  Interpretation & reporting
+**How to read the output (LMM):**
+- **Fixed effects**: baseline (intercept) and growth rate (time); `trt×visit` indicates **different growth rates** by group.  
+- **Random effects**: SD(intercept), SD(slope), and their **correlation** (do higher starters grow faster?).  
+- **Subject-level predictions** (BLUPs) can be used to visualize **individual curves**.
+
+**Conclusion template (LMM):**
+> *Outcome increased by [β_time] per visit on average (p<…). Compared with Placebo, Drug increased the growth rate by [β_trt:time] per visit (p<…). Substantial heterogeneity in slopes was observed (SD=…), indicating meaningful between‑subject variation.*
+
+# Part 6. GEE (population‑averaged effects; binary outcome)
+
+##  Theory in plain language (with formula)
+**Goal.** Estimate **population‑averaged** effects when outcomes are **binary or counts**.  
+**Model.**
+\[ g\{\mathbb{E}(Y_{ij})\} = X_{ij}\beta, \]
+with a **link** \(g(\cdot)\) (e.g., logit) and a **working correlation** (exchangeable, AR(1), …). Inference uses **robust (sandwich) SEs**; interpretation is **marginal** (population‑level) [@Diggle2002].
+
+> **Super Simplified Model (GEE):**  
+> $$\text{Population‑average of outcome} \approx \text{Average effect of group/time (on link scale)}$$  
+> GEE focuses on the **average person** (marginal effect). The working correlation improves **efficiency**; robust SEs protect inference even if the correlation is misspecified.
+
+**Mini example.** In a yes/no response study across visits, GEE with a **logit link** estimates **odds ratios** comparing Drug vs Placebo over time.
+
+##  Hands‑on in R (independent scenario: repeated binary outcome)
+```{r part6b-gee, message=FALSE, warning=FALSE}
+if (!requireNamespace("geepack", quietly = TRUE)) install.packages("geepack", repos="https://cloud.r-project.org")
+if (!requireNamespace("dplyr", quietly = TRUE)) install.packages("dplyr", repos="https://cloud.r-project.org")
+if (!requireNamespace("emmeans", quietly = TRUE)) install.packages("emmeans", repos="https://cloud.r-project.org")
+library(geepack); library(dplyr); library(emmeans)
+
+set.seed(5009)
+simulate_binary <- function(n=300, visits=c(0,4,8,12)) {
+  id <- factor(seq_len(n))
+  trt <- factor(sample(c("Placebo","Drug"), n, TRUE))
+  d <- expand.grid(id=id, visit=visits)
+  d <- dplyr::left_join(d, data.frame(id=id, trt=trt), by="id")
+  # logistic mean with treatment-by-time pattern
+  lin <- -0.3 + 0.15*d$visit + ifelse(d$trt=="Drug", 0.4 + 0.15*(d$visit/4), 0)
+  p <- 1/(1+exp(-lin))
+  d$y <- rbinom(nrow(d), 1, p)
+  # create an explicit factor for visit to avoid emmeans 'by' naming issues
+  d$visit_f <- factor(d$visit)
+  d
+}
+dat_gee <- simulate_binary()
+
+# Logistic GEE (population-averaged), explicit logit link
+gee_fit <- geeglm(
+  y ~ trt * visit_f,
+  id = id,
+  family = binomial(link = "logit"),
+  corstr = "ar1",
+  data = dat_gee
+)
+summary(gee_fit)
+
+# Visit-specific marginal probabilities and odds ratios
+emm_ge <- emmeans(gee_fit, ~ trt | visit_f, type = "response")
+emm_ge
+# 'pairs' automatically respects the conditioning on visit_f; don't pass a 'by' argument
+pairs(emm_ge, adjust = "none", odds.ratio = TRUE)
+```
+
+### What the code is doing
+- **Simulate repeated binary** responses with a treatment‑by‑time pattern.  
+- Fit **GEE (logit)** with AR(1) working correlation and **robust SEs**.  
+- **Interpret coefficients** as **odds ratios** after exponentiation.
+
+##  Interpretation & reporting (GEE — logistic, population‑averaged)
+
+> **Model context.** You fitted GEE for a **binary outcome** using `binomial(link = "logit")` with AR(1) working correlation. Coefficients are on the **log‑odds (logit)** scale; exponentiating gives **odds ratios (OR)**. Inference uses **robust (sandwich) SEs**, so results are valid even if the working correlation is misspecified.
+
+### Step 1. What each coefficient means (from `summary(gee_fit)`)
+- `(Intercept)` = baseline **log‑odds** of response for the **reference group** (Drug at Visit 0).
+- `trtPlacebo` = difference in **log‑odds** between Placebo vs Drug **at baseline**.
+- `factor(visit)4`, `8`, `12` = change in **log‑odds** from Visit 0 to that visit **for Drug**.
+- `trtPlacebo:factor(visit)k` = additional change for Placebo vs Drug at visit *k* (i.e., **how the group gap evolves over time**).
+- Wald tests (p‑values) assess whether each effect differs from 0 on the logit scale.
+
+> **Quick reading tip:** A negative interaction at a visit means **Placebo’s improvement is smaller** than Drug’s at that visit; positive means the opposite.
+
+### Step 2. Report visit‑specific, population‑averaged effects (with `emmeans`)
+Obtain **marginal response probabilities** and **odds ratios** by visit:
+```r
+library(emmeans)
+
+# Marginal (population-averaged) probabilities per arm and visit
+emm_ge <- emmeans(gee_fit, ~ trt | factor(visit), type = "response")
+emm_ge
+
+# Visit-specific Drug vs Placebo contrasts as OR (population-averaged)
+or_ge <- pairs(emm_ge, by = "factor(visit)", adjust = "none", odds.ratio = TRUE)
+or_ge
+```
+- `type = "response"` returns **probabilities** (0–1) instead of logits.  
+- `odds.ratio = TRUE` reports OR with robust SEs and CIs.  
+- These are **population‑averaged** (marginal) effects, not subject‑specific.
+
+### Step 3. How to read the tables
+- **EMMeans table (probabilities):** For each visit, compare the **predicted response probability** between Drug and Placebo.  
+  - Example: if at Week 8, Drug = 0.62 (95% CI 0.55–0.68) and Placebo = 0.47 (0.41–0.53), Drug shows a higher marginal response rate.
+- **OR table (pairwise contrasts):** The OR compares Drug vs Placebo **at the same visit**.  
+  - OR > 1 → Drug has higher odds of response; OR < 1 → lower odds.  
+  - 95% CI including 1 implies **not statistically significant** at that visit.
+
+### Step 4. Narrative (report‑ready paragraph)
+*Using GEE with a logit link and AR(1) working correlation, we estimated population‑averaged effects for the binary response. Baseline odds did not differ materially between groups. Over time, the Drug arm’s response probability increased more than Placebo, as reflected by negative Placebo×visit interaction terms in the logit model. Visit‑specific marginal estimates showed higher probabilities for Drug at later visits, and the corresponding odds‑ratio contrasts indicated [insert visits with OR>1 and CI excluding 1]. These results are based on robust (sandwich) standard errors and thus are valid even if the correlation structure is misspecified.*
+
+### Step 5. Super Simplified Model (logistic GEE)
+$$
+\text{logit}\{ \Pr(Y_{ij}=1) \}
+= \beta_0 + \beta_1\,\text{Trt}_i + \beta_2\,\text{Visit}_j + \beta_3\,(\text{Trt}_i\times\text{Visit}_j),
+$$
+with a **working correlation** (e.g., AR(1)) for repeated measures within subject *i*.
+**Idea:** We model the **average person’s** probability of response at each visit; robust SEs protect inference even if the working correlation is imperfect.
+
+# Part 7. Recap & Takeaway
+
+##  What are Repeated Measurements — revisited
+Repeated measurements occur when **the same subject is observed multiple times**, such as at *baseline, Week 4, Week 8, and Week 12*.  
+These within-person observations are **correlated**, because a person’s measurement today tends to resemble their own measurement last week.  
+Ignoring this correlation makes the analysis *too optimistic* — it underestimates variability and overstates significance.
+
+> **Key idea:**  
+> Repeated-measure analysis is not about having “more data points per person,”  
+> but about *correctly modeling how these points are related within each person.*
+
+---
+
+##  Why it matters
+Repeated-measure designs are powerful because they:
+- Track **change over time**, not just snapshots.  
+- Allow each subject to serve as their **own control**, removing between-person noise.  
+- Handle **dropouts and unbalanced visits**, when modern models like MMRM or LMM are used.  
+
+They are the backbone of longitudinal studies and clinical trials, where the question is rarely “Does the drug work at one point?” but rather “**How does the effect evolve over time?**”
+
+---
+
+##  Recap of the Methods
+
+```{r recap-table, message=FALSE, warning=FALSE, results='asis',echo=FALSE}
+# ---- Recap of Methods (formatted table) ----
+# Required packages
+if (!requireNamespace("kableExtra", quietly = TRUE))
+  install.packages("kableExtra", repos = "https://cloud.r-project.org")
+if (!requireNamespace("knitr", quietly = TRUE))
+  install.packages("knitr", repos = "https://cloud.r-project.org")
+
+library(knitr)
+library(kableExtra)
+
+# Construct summary table
+methods_tbl <- data.frame(
+  Method = c("RM-ANOVA", "LMM (Random-Effects)", "MMRM", "GEE"),
+  Focus = c(
+    "Within-subject change under sphericity",
+    "Individual trajectories (person-specific slopes/intercepts)",
+    "Visit-specific adjusted means (population averages per timepoint)",
+    "Population-averaged effects for binary/count outcomes"
+  ),
+  Handles_Missing = c("No", "Yes", "Yes (MAR)", "Yes"),
+  Typical_Use = c(
+    "Balanced, complete designs",
+    "Modeling subject-level trends",
+    "Continuous outcomes in clinical trials",
+    "Binary or count outcomes"
+  ),
+  Key_Assumptions = c(
+    "Sphericity (equal variances of differences)",
+    "Random effects correctly specified",
+    "MAR assumption, unstructured covariance",
+    "Correct link and working correlation structure"
+  ),
+  stringsAsFactors = FALSE
+)
+
+# Display nicely formatted table with adjustable widths
+kbl(
+  methods_tbl,
+  align = "lcccc",
+  caption = "Recap of Repeated Measurement Methods"
+) %>%
+  kable_styling(
+    full_width = FALSE,
+    bootstrap_options = c("striped", "hover"),
+    position = "center",
+    font_size = 13
+  ) %>%
+  column_spec(1, width = "2.5cm") %>%
+  column_spec(2, width = "4cm") %>%
+  column_spec(3, width = "2.2cm") %>%
+  column_spec(4, width = "3.5cm") %>%
+  column_spec(5, width = "4.2cm")
+```
+---
+
+##  What’s most important to remember
+1. **Correlation is the core** — every repeated-measure method exists to model this dependency.  
+2. **Visualization first** — always inspect spaghetti plots and mean profiles before modeling.  
+3. **Choose the method that matches your goal:**
+   - If you want *by-visit means*, use **MMRM**.  
+   - If you want *subject-specific trends*, use **LMM**.  
+   - If your outcome is binary/count, use **GEE**.  
+   - If data are balanced and complete, **RM-ANOVA** is fine.  
+4. **Interpretation should be clinical, not mathematical:**  
+   Report the meaning of estimates (e.g., *difference in adjusted mean at Week 12*) and their uncertainty, not just p-values.
+
+---
+
+> **Final Thought**  
+> Repeated-measure analysis is about telling a story —  
+> how individuals and populations change over time.  
+> Choosing the right model ensures that story is *statistically honest* and *scientifically meaningful*.
+
+# Part 8. References
+

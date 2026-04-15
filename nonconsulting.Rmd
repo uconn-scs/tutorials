@@ -1,0 +1,223 @@
+---
+title: "Nonconsulting writing: Logistic Regression"
+output:
+  html_document:
+    css: styles.css
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    df_print: paged
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE, fig.width = 7, fig.height = 4.5
+)
+```
+
+```{r}
+library(xtable)
+library(tidyverse)
+library(pROC)
+library(ggplot2)
+```
+
+
+# Bernoulli and Binomial random variables 
+
+R code simulating Bernoulli (0/1) random outcomes:
+```{r}
+p1 <- 0.5
+yi <- rbinom(5, 1, p1); yi
+```
+
+R code simulating Binomial random outcomes:
+```{r}
+p2 <- 0.7
+yi <- rbinom(10, 5, p2); yi
+```
+
+
+Plot for binary response variable compared to continuous response variable
+```{r}
+# ---- Simulate two types of responses ----
+n <- 100
+
+# Continuous response (e.g. blood pressure, weight)
+y_cont <- rnorm(n, mean = 50, sd = 10)
+
+# Binary response (e.g. disease: 0 = no, 1 = yes)
+p <- 0.3                  # probability of "1"
+y_bin <- rbinom(n, 1, p)  # 0/1 outcomes
+
+# ---- Plot: continuous vs binary response ----
+par(mfrow = c(1, 2))
+
+# Left: continuous response
+plot(1:n, y_cont,
+     pch = 19,
+     xlab = "Observation index",
+     ylab = "Continuous response",
+     main = "Continuous response")
+
+# Right: binary response
+plot(1:n, jitter(y_bin, amount = 0.05),
+     pch = 19,
+     xlab = "Observation index",
+     ylab = "Binary response (0 or 1)",
+     main = "Binary response",
+     yaxt = "n")
+axis(2, at = c(0, 1), labels = c("0", "1"))
+abline(h = 0:1, lty = 2, col = "grey")
+par(mfrow = c(1, 1))
+```
+
+
+Running logistic regression with simulated data and interpretation on the coefficients.
+
+The logistic regression model examining the relationship between $x$ and the binary outcome $y$ shows that $x$ is a statistically significant predictor with $z = 4.61$ and $p < 0.001$. While the estimated coefficient for $x$ is $0.134$, which corresponds to an odds ratio of $1.14$, this means that for every one-unit increase in $x$, the odds of the outcome being a `success` (1) increase approximately 14%, holding all else constant. The intercept estimate is $-6.54$ (odds ratio $\approx 0.0014$), representing the log-odds of the outcome being 1 when $x = 0$. 
+
+Model fit statistics indicate improvement over the null model: the null deviance reduced from $165.15$ to $133.34$, meaning the model explains more variation in the outcome than a model with no predictors. The AIC value of $137.34$ can be used to compare this model with alternative models (lower AIC indicates better fit).
+Overall, the results suggest strong evidence that higher values of $x$ are associated with a greater probability of $y = 1$. 
+```{r}
+# Simulated binary response
+n <- 120
+x <- rnorm(n, 50, 10)
+p <- plogis((x - 50)/8)
+y <- rbinom(n, 1, p)
+
+# Logistic regression
+logit_model <- glm(y ~ x, family = binomial)
+
+summary(logit_model)
+exp(coef(logit_model))   # Odds ratios
+```
+
+
+Predict probabilities of each observation has outcome = 1, can be derived from using the fitted logistic regression. 
+```{r}
+pred_prob <- predict(logit_model, type = "response")
+head(pred_prob)
+```
+
+We turn probabilities into actual predicted classes (0 or 1). We choose a cutoff (threshold) value, typically 0.5--if probability $> 0.5$, then predict as 1, if probability $\leq 0.5$ then predict the outcome as 0--for constructing the classification table. The following printed table is called the confusion matrix, where it shows how many cases the model predicted correctly or incorrectly.
+```{r}
+threshold <- 0.5
+pred_class <- ifelse(pred_prob > threshold, 1, 0)
+
+table(Actual = y, Predicted = pred_class)
+```
+
+The ROC curve helps us evaluate how well the model classifies 0 vs 1 across all possible thresholds, not just 0.5. When the AUC = 0.5, it means that the model is no better than guessing, and AUC closer to 1 indicates a better classification. 
+```{r}
+roc_obj <- roc(y, pred_prob)
+plot(roc_obj, col="darkgreen", lwd=3, main="ROC Curve")
+auc(roc_obj)
+```
+
+
+
+# Data analysis with logistic regression
+
+We us the `mtcars` dataset, which contains information of 32 car models. For logistic regression, we create a data frame with the following key variables to be included in the model. \ 
+
+`am` is a variable indicating transmission type, which is our binary outcome. \
+`wt` is car weight, a predictor measured in 1000 pounds. \
+`hp` is horsepower, which is another continuous predictor. \
+```{r}
+data(mtcars)
+df <- within(mtcars, {
+  am <- as.integer(am)        # ensure binary 0/1
+  wt <- wt                    # weight (1000 lbs)
+  hp <- hp                    # horsepower
+})
+
+dim(mtcars)
+```
+
+The logistic regression model examines whether car weight `wt` and horsepower `hp` predict the probability of a car having a manual transmission `am` = 1, instead of automatic. 
+
+Both predictors are statistically significant:  \
+
+`wt` has a negative effect with estimate = $-8.08$, $p = 0.008$, indicating heavier cars are less likely to have manual transmission. \ 
+
+`hp` has a positive effect with estimate = $0.036$, $p = 0.041$, indicating cars with higher horsepower are more likely to have manual transmission. \
+
+```{r}
+# 2) Fit logistic regression ---------------------------------
+# logit(P(am=1)) = beta0 + beta1*wt + beta2*hp
+fit <- glm(am ~ wt + hp, data = df, family = binomial(link = "logit"))
+
+cat("\n=== Model summary (logit scale) ===\n")
+print(summary(fit))
+```
+
+Additional interpretation on the coefficients. 
+```{r}
+# 3) Odds ratios and 95% CI ----------------------------------
+# OR = exp(beta). For a one-unit increase in the predictor, odds multiply by OR.
+coefs <- coef(fit)
+OR <- exp(coefs); OR
+```
+
+
+We can also derive the confidence interval of the OR 
+```{r}
+# Profile-likelihood CI for coefficients, then exponentiate to get OR CI
+ci_beta <- suppressMessages(confint(fit))
+OR_CI <- exp(ci_beta)
+
+cat("\n=== Odds Ratios (with 95% CI) ===\n")
+print(data.frame(
+  term = names(OR),
+  OR = OR,
+  OR_low = OR_CI[, 1],
+  OR_high = OR_CI[, 2],
+  row.names = NULL
+), digits = 3)
+```
+
+Predicted probabilities for `am` = 1 for each observation 
+```{r}
+# 4) Predicted probabilities for each observation -------------
+df$phat <- predict(fit, type = "response")  # P(am=1 | wt, hp)
+
+cat("\n=== First 6 predicted probabilities (P(manual)) ===\n")
+print(head(df[, c("wt", "hp", "am", "phat")], 6), digits = 3)
+```
+
+
+
+# Comparison of different link functions
+
+In logistic regression and general linear models (GLMs) for binary outcomes, we do not model the probability directly. Instead, we model a transformed version of the probability using a link funciton. The code below plots the inverse link functions, showing how each link converts the linear predictor into a probability between 0 and 1. The x-axis represents the linear predictor 
+\[ \eta = \beta_0 + \beta_1 x\]
+and the y-axis shows the corresponding predicted probability $p$. 
+
+```{r}
+eta <- seq(-5, 5, length.out = 400)
+curve_logit <- plogis(eta)
+curve_probit <- pnorm(eta)
+curve_cloglog <- 1 - exp(-exp(eta))
+curve_cauchit <- pcauchy(eta)
+
+plot(eta, curve_logit, type="l", lwd=2, xlab=expression(eta),
+ylab=expression(p==g^{-1}(eta)), main="Inverse links: p(eta)")
+lines(eta, curve_probit, lwd=2, lty=2)
+lines(eta, curve_cloglog, lwd=2, lty=3)
+lines(eta, curve_cauchit, lwd=2, lty=4)
+legend("topleft", lwd=2, lty=1:4, bty="n",
+legend=c("logit","probit","cloglog","cauchit"))
+
+```
+
+
+```{r}
+lr.logit <- glm(am ~ wt + hp, family = binomial(link = "logit"), data = df)   
+lr.probit <- glm(am ~ wt + hp, family = binomial(link = "probit"), data = df)  
+lr.cloglog <- glm(am ~ wt + hp, family = binomial(link = "cloglog"), data = df) 
+lr.cauchit <- glm(am ~ wt + hp, family = binomial(link = "cauchit"), data = df) 
+```
+
+
